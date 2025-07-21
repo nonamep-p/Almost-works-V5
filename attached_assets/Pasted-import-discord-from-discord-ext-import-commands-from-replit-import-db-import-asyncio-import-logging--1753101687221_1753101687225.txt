@@ -1,0 +1,448 @@
+import discord
+from discord.ext import commands
+from replit import db
+import asyncio
+import logging
+from datetime import datetime
+from utils.helpers import create_embed, format_number
+from config import COLORS, get_server_config, update_server_config, user_has_permission
+from utils.database import get_guild_data, update_guild_data, get_user_data, update_user_data
+from utils.helpers import format_duration
+from rpg_data.game_data import ITEMS # Corrected import path
+import psutil
+import os
+from typing import Optional, Dict, Any, List, Union
+import traceback
+
+logger = logging.getLogger(__name__)
+
+# Fallback imports
+try:
+    from config import MODULES
+except ImportError:
+    logger.warning("Could not import 'MODULES' from config.py. Using default values.")
+    MODULES = {
+        'rpg': {'name': 'RPG System', 'emoji': '🎮', 'description': 'Adventure, combat, and character progression'},
+        'economy': {'name': 'Economy System', 'emoji': '💰', 'description': 'Jobs, money, and trading'},
+    }
+
+try:
+    from config import get_prefix
+except ImportError:
+    logger.warning("Could not import 'get_prefix' from config.py. Using default prefix function.")
+    def get_prefix(bot, message):
+        guild_id = getattr(message.guild, 'id', None)
+        if guild_id:
+            guild_data = get_guild_data(str(guild_id)) or {}
+            return guild_data.get('prefix', '$')
+        return '$'
+
+# --- Modals ---
+
+class ModifyStatsModal(discord.ui.Modal, title="📝 Modify User Stats"):
+    level = discord.ui.TextInput(label="Level", placeholder="Enter new level", required=True)
+    gold = discord.ui.TextInput(label="Gold", placeholder="Enter new gold amount", required=True)
+    xp = discord.ui.TextInput(label="XP", placeholder="Enter new XP amount", required=True)
+    strength = discord.ui.TextInput(label="Strength (STR)", placeholder="Enter new strength value", required=True)
+    dexterity = discord.ui.TextInput(label="Dexterity (DEX)", placeholder="Enter new dexterity value", required=True)
+
+    def __init__(self, target_member: discord.Member):
+        super().__init__()
+        self.target_member = target_member
+        user_data = get_user_data(str(target_member.id)) or {}
+        stats = user_data.get('stats', {})
+
+        self.level.default = str(user_data.get('level', 1))
+        self.gold.default = str(user_data.get('gold', 0))
+        self.xp.default = str(user_data.get('xp', 0))
+        self.strength.default = str(stats.get('strength', 5))
+        self.dexterity.default = str(stats.get('dexterity', 5))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            user_data = get_user_data(str(self.target_member.id)) or {}
+            stats = user_data.get('stats', {})
+
+            user_data['level'] = int(self.level.value)
+            user_data['gold'] = int(self.gold.value)
+            user_data['xp'] = int(self.xp.value)
+            stats['strength'] = int(self.strength.value)
+            stats['dexterity'] = int(self.dexterity.value)
+            user_data['stats'] = stats
+
+            update_user_data(str(self.target_member.id), user_data)
+            await interaction.response.send_message(f"✅ Successfully updated stats for {self.target_member.mention}.", ephemeral=True)
+        except ValueError:
+            await interaction.response.send_message("❌ Invalid input. Please ensure all values are numbers.", ephemeral=True)
+        except Exception as e:
+            logger.error(f"Error in ModifyStatsModal: {e}")
+            await interaction.response.send_message(f"❌ An unexpected error occurred.", ephemeral=True)
+
+class UserSearchModal(discord.ui.Modal, title="🔎 Search for User"):
+    user_input = discord.ui.TextInput(label="User ID or Name#Tag", placeholder="e.g., 1297013439125917766 or Plagg#1234", required=True)
+
+    def __init__(self, original_interaction: discord.Interaction):
+        super().__init__()
+        self.original_interaction = original_interaction
+        self.bot = original_interaction.client
+
+    async def on_submit(self, interaction: discord.Interaction):
+        query = self.user_input.value
+        guild = self.bot.get_guild(interaction.guild_id)
+        member = None
+        try:
+            if '#' in query:
+                name, discrim = query.split('#', 1)
+                member = discord.utils.get(guild.members, name=name, discriminator=discrim)
+            else:
+                member = guild.get_member(int(query))
+        except (ValueError, AttributeError):
+            pass
+
+        if member:
+            view = ManageUserView(interaction.user.id, guild.id, self.bot, member)
+            embed = view.create_embed()
+            await self.original_interaction.edit_original_response(embed=embed, view=view)
+            await interaction.response.defer() # Acknowledge the modal submission
+        else:
+            await interaction.response.send_message(f"❌ Could not find a member matching `{query}`.", ephemeral=True)
+
+class ColorModal(discord.ui.Modal):
+    color_input = discord.ui.TextInput(label="New Hex Color Code", placeholder="e.g., #FF5733", min_length=7, max_length=7)
+
+    def __init__(self, guild_id: int, color_key: str):
+        super().__init__(title=f"🎨 Set {color_key.replace('_', ' ').title()} Color")
+        self.guild_id = guild_id
+        self.color_key = color_key
+
+    async def on_submit(self, interaction: discord.Interaction):
+        color_hex = self.color_input.value
+        if not color_hex.startswith('#') or len(color_hex) != 7:
+            await interaction.response.send_message("❌ Invalid format. Please use a 7-digit hex code (e.g., `#RRGGBB`).", ephemeral=True)
+            return
+
+        try:
+            int(color_hex[1:], 16) # Validate hex
+        except ValueError:
+            await interaction.response.send_message("❌ Invalid hex code. Please check the code and try again.", ephemeral=True)
+            return
+
+        guild_data = get_guild_data(str(self.guild_id)) or {}
+        if 'colors' not in guild_data:
+            guild_data['colors'] = {}
+        guild_data['colors'][self.color_key] = color_hex
+        update_guild_data(str(self.guild_id), guild_data)
+
+        await interaction.response.send_message(f"✅ {self.color_key.title()} color updated to `{color_hex}`.", ephemeral=True)
+
+# --- Views ---
+
+class BaseAdminView(discord.ui.View):
+    def __init__(self, user_id: int, guild_id: int, bot: commands.Bot, timeout=300):
+        super().__init__(timeout=timeout)
+        self.user_id = user_id
+        self.guild_id = guild_id
+        self.bot = bot
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ This isn't your panel!", ephemeral=True)
+            return False
+        return True
+
+    def create_embed(self):
+        raise NotImplementedError("Subclasses must implement create_embed()")
+
+    @discord.ui.button(label="🔙 Back to Main", style=discord.ButtonStyle.danger, emoji="🔙", row=4)
+    async def back_to_main(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = ConfigMainView(self.user_id, self.guild_id, self.bot)
+        embed = await view.create_main_embed(interaction.guild.name)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+class SetChannelView(BaseAdminView):
+    def __init__(self, user_id: int, guild_id: int, bot: commands.Bot, config_key: str, title: str, max_values: int = 1):
+        super().__init__(user_id, guild_id, bot)
+        self.config_key = config_key
+        self.title = title
+        self.max_values = max_values
+        self.add_item(self.create_channel_select())
+
+    def create_channel_select(self):
+        select = discord.ui.ChannelSelect(
+            placeholder=f"Select up to {self.max_values} channel(s) for {self.title}...",
+            min_values=0, # Allow clearing the selection
+            max_values=self.max_values
+        )
+        select.callback = self.save_channels
+        return select
+
+    async def save_channels(self, interaction: discord.Interaction):
+        select_component = interaction.data['values']
+        channel_ids = [int(cid) for cid in select_component]
+
+        guild_data = get_guild_data(str(self.guild_id)) or {}
+        if 'channels' not in guild_data:
+            guild_data['channels'] = {}
+        
+        if not channel_ids:
+            guild_data['channels'].pop(self.config_key, None)
+            msg = f"✅ {self.title} channels have been cleared."
+        elif self.max_values > 1:
+            guild_data['channels'][self.config_key] = channel_ids
+            msg = f"✅ {self.title} channels have been updated."
+        else:
+            guild_data['channels'][self.config_key] = channel_ids[0]
+            msg = f"✅ {self.title} channel has been updated."
+            
+        update_guild_data(str(self.guild_id), guild_data)
+        
+        view = ChannelConfigView(self.user_id, self.guild_id, self.bot)
+        embed = view.create_embed()
+        await interaction.response.edit_message(embed=embed, view=view)
+        await interaction.followup.send(msg, ephemeral=True)
+
+    def create_embed(self):
+        return discord.Embed(
+            title=f"📢 Configure {self.title} Channels",
+            description=f"Use the dropdown to select channels. To clear the setting, open the dropdown and click outside of it without selecting anything, then click this message again.",
+            color=COLORS['info']
+        )
+        
+class ChannelConfigView(BaseAdminView):
+    def create_embed(self):
+        guild_data = get_guild_data(str(self.guild_id)) or {}
+        channels = guild_data.get('channels', {})
+        embed = discord.Embed(title="📢 Channel Configuration", description="Designate channels for bot functions.", color=COLORS['primary'])
+
+        def format_channel_list(channel_ids: Optional[Union[List[int], int]]) -> str:
+            if not channel_ids: return "*Not Set*"
+            if not isinstance(channel_ids, list): channel_ids = [channel_ids]
+            return "\n".join(f"<#{cid}>" for cid in channel_ids) or "*Not Set*"
+
+        embed.add_field(name="🎮 RPG Channels", value=format_channel_list(channels.get('rpg_channels')), inline=False)
+        embed.add_field(name="📜 Log Channel", value=format_channel_list(channels.get('log_channel')), inline=False)
+        embed.add_field(name="👋 Welcome Channel", value=format_channel_list(channels.get('welcome_channel')), inline=False)
+        return embed
+
+    @discord.ui.button(label="Set RPG Channels", style=discord.ButtonStyle.primary, emoji="🎮", row=1)
+    async def set_rpg_channels(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = SetChannelView(self.user_id, self.guild_id, self.bot, 'rpg_channels', "RPG", max_values=10)
+        await interaction.response.edit_message(embed=view.create_embed(), view=view)
+
+    @discord.ui.button(label="Set Log Channel", style=discord.ButtonStyle.primary, emoji="📜", row=1)
+    async def set_log_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = SetChannelView(self.user_id, self.guild_id, self.bot, 'log_channel', "Log", max_values=1)
+        await interaction.response.edit_message(embed=view.create_embed(), view=view)
+
+    @discord.ui.button(label="Set Welcome Channel", style=discord.ButtonStyle.primary, emoji="👋", row=1)
+    async def set_welcome_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = SetChannelView(self.user_id, self.guild_id, self.bot, 'welcome_channel', "Welcome", max_values=1)
+        await interaction.response.edit_message(embed=view.create_embed(), view=view)
+
+class GiveItemView(BaseAdminView):
+    def __init__(self, user_id: int, guild_id: int, bot: commands.Bot, target_member: discord.Member):
+        super().__init__(user_id, guild_id, bot)
+        self.target_member = target_member
+        self.add_item(self.create_item_dropdown())
+
+    def create_item_dropdown(self):
+        options = [discord.SelectOption(label=item_data['name'], value=item_id, emoji='🎁') for item_id, item_data in list(ITEMS.items())[:25]]
+        select = discord.ui.Select(placeholder="Select an item to give...", options=options)
+        select.callback = self.item_select_callback
+        return select
+
+    async def item_select_callback(self, interaction: discord.Interaction):
+        item_id = interaction.data['values'][0]
+        item_name = ITEMS[item_id]['name']
+        user_data = get_user_data(str(self.target_member.id)) or {}
+        inventory = user_data.get('inventory', {})
+        inventory[item_id] = inventory.get(item_id, 0) + 1
+        user_data['inventory'] = inventory
+        update_user_data(str(self.target_member.id), user_data)
+        await interaction.response.send_message(f"✅ Gave 1x {item_name} to {self.target_member.mention}.", ephemeral=True)
+
+    def create_embed(self):
+        return discord.Embed(title=f"🎁 Give Item to {self.target_member.display_name}", description="Select an item from the dropdown below.", color=COLORS['info'])
+
+class ManageUserView(BaseAdminView):
+    def __init__(self, user_id: int, guild_id: int, bot: commands.Bot, target_member: discord.Member):
+        super().__init__(user_id, guild_id, bot)
+        self.target_member = target_member
+        if hasattr(self.bot, 'owner_id') and user_id == self.bot.owner_id:
+            self.add_item(self.create_grant_infinite_button())
+
+    def create_grant_infinite_button(self):
+        button = discord.ui.Button(label="👑 Grant Infinite Power", style=discord.ButtonStyle.success, emoji="✨", row=2)
+        button.callback = self.grant_infinite_power
+        return button
+
+    async def grant_infinite_power(self, interaction: discord.Interaction):
+        user_data = get_user_data(str(self.target_member.id)) or {}
+        user_data.update({'level': 999, 'gold': 999999999999, 'xp': 0, 'stats': {'strength': 999, 'dexterity': 999, 'constitution': 999, 'intelligence': 999, 'wisdom': 999, 'charisma': 999}})
+        update_user_data(str(self.target_member.id), user_data)
+        await interaction.response.edit_message(embed=self.create_embed(), view=self)
+        await interaction.followup.send(f"✨ Infinite power granted to {self.target_member.mention}!", ephemeral=True)
+
+    def create_embed(self):
+        user_data = get_user_data(str(self.target_member.id)) or {}
+        stats = user_data.get('stats', {})
+        embed = discord.Embed(title=f"👤 Managing: {self.target_member.display_name}", description=f"**ID:** `{self.target_member.id}`", color=COLORS['info'])
+        embed.set_thumbnail(url=self.target_member.display_avatar.url)
+        embed.add_field(name="Level", value=user_data.get('level', 1))
+        embed.add_field(name="Gold", value=f"{user_data.get('gold', 0):,}")
+        embed.add_field(name="XP", value=user_data.get('xp', 0))
+        embed.add_field(name="STR", value=stats.get('strength', 5))
+        embed.add_field(name="DEX", value=stats.get('dexterity', 5))
+        return embed
+
+    @discord.ui.button(label="📝 Modify Stats", style=discord.ButtonStyle.primary, emoji="�", row=1)
+    async def modify_stats(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(ModifyStatsModal(self.target_member))
+
+    @discord.ui.button(label="🎁 Give Item", style=discord.ButtonStyle.primary, emoji="🎁", row=1)
+    async def give_item(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = GiveItemView(self.user_id, self.guild_id, self.bot, self.target_member)
+        await interaction.response.edit_message(embed=view.create_embed(), view=view)
+
+class UserManagementView(BaseAdminView):
+    def create_embed(self):
+        return discord.Embed(title="👥 User Management", description="Select a user from the dropdown or find them by ID/Name to manage their data.", color=COLORS['primary'])
+    
+    @discord.ui.user_select(placeholder="Select a user to manage...", row=0)
+    async def select_user_callback(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
+        target_member = select.values[0]
+        if not isinstance(target_member, discord.Member):
+            target_member = interaction.guild.get_member(target_member.id)
+        if target_member:
+            view = ManageUserView(self.user_id, self.guild_id, self.bot, target_member)
+            await interaction.response.edit_message(embed=view.create_embed(), view=view)
+        else:
+            await interaction.response.send_message("Could not find that user in this server.", ephemeral=True)
+
+    @discord.ui.button(label="🔎 Find User by ID/Name", style=discord.ButtonStyle.primary, emoji="🔎", row=1)
+    async def find_user(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(UserSearchModal(interaction))
+
+class DatabaseToolsView(BaseAdminView):
+    def create_embed(self):
+        guild_data = get_guild_data(str(self.guild_id)) or {}
+        xp_rate = guild_data.get('xp_multiplier', 1.0)
+        gold_rate = guild_data.get('gold_multiplier', 1.0)
+        embed = discord.Embed(title="🗄️ Database Tools", description="Manage server-wide data settings.", color=COLORS['primary'])
+        embed.add_field(name="✨ XP Multiplier", value=f"`{xp_rate}x`", inline=True)
+        embed.add_field(name="💰 Gold Multiplier", value=f"`{gold_rate}x`", inline=True)
+        return embed
+
+    @discord.ui.button(label="⚙️ Set Multipliers", style=discord.ButtonStyle.primary, emoji="⚙️", row=1)
+    async def set_multipliers(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(MultiplierModal(self.guild_id))
+
+class CustomizationView(BaseAdminView):
+    def create_embed(self):
+        return discord.Embed(title="🎨 Customization", description="Customize the bot's appearance and channel settings.", color=COLORS['primary'])
+
+    @discord.ui.button(label="Set Colors", style=discord.ButtonStyle.secondary, emoji="🎨", row=1)
+    async def set_colors(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(ColorModal(self.guild_id, 'primary'))
+
+    @discord.ui.button(label="📢 Channel Settings", style=discord.ButtonStyle.primary, emoji="📢", row=2)
+    async def channel_settings(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = ChannelConfigView(self.user_id, self.guild_id, self.bot)
+        await interaction.response.edit_message(embed=view.create_embed(), view=view)
+
+class StatisticsView(BaseAdminView):
+    def create_embed(self):
+        uptime_delta = datetime.now() - self.bot.start_time
+        uptime_str = format_duration(uptime_delta.total_seconds())
+        embed = discord.Embed(title="📊 Bot Statistics", color=COLORS['info'])
+        embed.add_field(name="Servers", value=len(self.bot.guilds))
+        embed.add_field(name="Users", value=len(self.bot.users))
+        embed.add_field(name="Uptime", value=uptime_str)
+        return embed
+
+    @discord.ui.button(label="🔄 Refresh", style=discord.ButtonStyle.primary, emoji="🔄")
+    async def refresh_stats(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(embed=self.create_embed(), view=self)
+
+class ModuleManagementView(BaseAdminView):
+    def create_embed(self):
+        guild_data = get_guild_data(str(self.guild_id)) or {}
+        embed = discord.Embed(title="🔧 Module Management", color=COLORS['primary'])
+        for name, info in MODULES.items():
+            enabled = guild_data.get('modules', {}).get(name, True)
+            embed.add_field(name=f"{info['emoji']} {info['name']}", value="✅ Enabled" if enabled else "❌ Disabled", inline=False)
+        return embed
+
+    @discord.ui.select(placeholder="🔧 Select module to toggle...", options=[discord.SelectOption(label=info['name'], value=name, emoji=info['emoji']) for name, info in MODULES.items()])
+    async def module_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        module = select.values[0]
+        guild_data = get_guild_data(str(self.guild_id)) or {}
+        if 'modules' not in guild_data: guild_data['modules'] = {}
+        key = module
+        guild_data['modules'][key] = not guild_data['modules'].get(key, True)
+        update_guild_data(str(self.guild_id), guild_data)
+        await interaction.response.edit_message(embed=self.create_embed(), view=self)
+
+class ConfigMainView(BaseAdminView):
+    async def create_main_embed(self, guild_name: str):
+        embed = discord.Embed(title="🛠️ Bot Configuration Panel", description=f"Managing settings for **{guild_name}**.", color=COLORS['info'])
+        config = get_server_config(self.guild_id)
+        enabled_modules = sum(1 for enabled in config.get('modules', {}).values() if enabled)
+        total_modules = len(MODULES)
+        embed.add_field(name="📊 Status", value=f"**Modules:** {enabled_modules}/{total_modules}\n**Prefix:** `{config.get('prefix', '$')}`", inline=True)
+        module_status = "\n".join([f"**{info['name']}:** {'✅' if config.get('modules', {}).get(name, True) else '❌'}" for name, info in MODULES.items()])
+        embed.add_field(name="🎮 Modules", value=module_status, inline=True)
+        embed.set_footer(text="Click buttons to configure features.")
+        return embed
+
+    @discord.ui.button(label="🔧 Modules", style=discord.ButtonStyle.success, emoji="🔧", row=1)
+    async def module_management(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = ModuleManagementView(self.user_id, self.guild_id, self.bot)
+        await interaction.response.edit_message(embed=view.create_embed(), view=view)
+
+    @discord.ui.button(label="👥 Users", style=discord.ButtonStyle.danger, emoji="👥", row=1)
+    async def user_management(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = UserManagementView(self.user_id, self.guild_id, self.bot)
+        await interaction.response.edit_message(embed=view.create_embed(), view=view)
+
+    @discord.ui.button(label="💾 Database", style=discord.ButtonStyle.secondary, emoji="💾", row=2)
+    async def database_tools(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = DatabaseToolsView(self.user_id, self.guild_id, self.bot)
+        await interaction.response.edit_message(embed=view.create_embed(), view=view)
+
+    @discord.ui.button(label="🎨 Customize", style=discord.ButtonStyle.secondary, emoji="🎨", row=2)
+    async def customization(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = CustomizationView(self.user_id, self.guild_id, self.bot)
+        await interaction.response.edit_message(embed=view.create_embed(), view=view)
+
+    @discord.ui.button(label="📈 Stats", style=discord.ButtonStyle.primary, emoji="📈", row=0)
+    async def statistics(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = StatisticsView(self.user_id, self.guild_id, self.bot)
+        await interaction.response.edit_message(embed=view.create_embed(), view=view)
+
+class Admin(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        if not hasattr(bot, 'start_time'): 
+            self.bot.start_time = datetime.now()
+
+    @commands.command(name="admin", aliases=["config", "settings"])
+    @commands.has_permissions(administrator=True)
+    async def admin_panel(self, ctx: commands.Context):
+        """Opens the comprehensive admin control panel."""
+        view = ConfigMainView(ctx.author.id, ctx.guild.id, self.bot)
+        embed = await view.create_main_embed(ctx.guild.name)
+        await ctx.send(embed=embed, view=view)
+
+    @commands.command(name="setinfinite")
+    @commands.is_owner()
+    async def set_infinite(self, ctx: commands.Context, member: discord.Member):
+        """Grants a user 'infinite' stats. Owner only."""
+        user_data = get_user_data(str(member.id)) or {}
+        user_data.update({'level': 999, 'gold': 999999999999, 'xp': 0, 'stats': {'strength': 999, 'dexterity': 999, 'constitution': 999, 'intelligence': 999, 'wisdom': 999, 'charisma': 999}})
+        update_user_data(str(member.id), user_data)
+        await ctx.send(f"✨ Infinite power granted to {member.mention}!")
+
+async def setup(bot):
+    await bot.add_cog(Admin(bot))
+�

@@ -1,0 +1,34 @@
+19:20:07 | discord.ui.view | ERROR | Ignoring exception in view <SkillSelectionView timeout=30 children=1> for item <Select placeholder='Choose a skill to use...' min_values=1 max_values=1 disabled=False>
+Traceback (most recent call last):
+  File "/home/runner/workspace/.pythonlibs/lib/python3.11/site-packages/discord/ui/view.py", line 435, in _scheduled_task
+    await item.callback(interaction)
+  File "/home/runner/workspace/cogs/rpg_combat.py", line 915, in skill_select
+    await self.combat_view.use_skill(interaction, skill_key)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'TacticalCombatView' object has no attribute 'use_skill'
+19:20:39 | discord.ui.view | ERROR | Ignoring exception in view <ShopMainView timeout=300 children=6> for item <Button style=<ButtonStyle.primary: 1> url=None disabled=False label='⚔️ Weapons' emoji=<PartialEmoji animated=False name='⚔️' id=None> row=0 sku_id=None>
+Traceback (most recent call last):
+  File "/home/runner/workspace/.pythonlibs/lib/python3.11/site-packages/discord/ui/view.py", line 435, in _scheduled_task
+    await item.callback(interaction)
+  File "/home/runner/workspace/cogs/rpg_shop.py", line 28, in weapons_button
+    await interaction.response.edit_message(embed=embed, view=view)
+  File "/home/runner/workspace/.pythonlibs/lib/python3.11/site-packages/discord/interactions.py", line 1154, in edit_message
+    response = await adapter.create_interaction_response(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/runner/workspace/.pythonlibs/lib/python3.11/site-packages/discord/webhook/async_.py", line 226, in request
+    raise HTTPException(response, data)
+discord.errors.HTTPException: 400 Bad Request (error code: 50035): Invalid Form Body
+In data.components.0.components.0.options: This field is required
+19:20:45 | discord.ui.view | ERROR | Ignoring exception in view <ShopMainView timeout=300 children=6> for item <Button style=<ButtonStyle.primary: 1> url=None disabled=False label='✨ Artifacts' emoji=<PartialEmoji animated=False name='✨' id=None> row=1 sku_id=None>
+Traceback (most recent call last):
+  File "/home/runner/workspace/.pythonlibs/lib/python3.11/site-packages/discord/ui/view.py", line 435, in _scheduled_task
+    await item.callback(interaction)
+  File "/home/runner/workspace/cogs/rpg_shop.py", line 68, in artifacts_button
+    await interaction.response.edit_message(embed=embed, view=view)
+  File "/home/runner/workspace/.pythonlibs/lib/python3.11/site-packages/discord/interactions.py", line 1154, in edit_message
+    response = await adapter.create_interaction_response(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/runner/workspace/.pythonlibs/lib/python3.11/site-packages/discord/webhook/async_.py", line 226, in request
+    raise HTTPException(response, data)
+discord.errors.HTTPException: 400 Bad Request (error code: 50035): Invalid Form Body
+In data.components.0.components.0.options: This field is required
